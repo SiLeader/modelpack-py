@@ -11,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import zlib
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -91,6 +92,7 @@ class FakeOrasClient(oras.client.OrasClient):
         self.blobs: dict[str, bytes] = {}
         self.manifest_bytes: bytes | None = None
         self.requests: list[tuple[str, str]] = []
+        self.request_headers: list[dict[str, str]] = []
         self._uploads: dict[str, bytearray] = {}
 
     @property
@@ -108,6 +110,7 @@ class FakeOrasClient(oras.client.OrasClient):
         request = requests.Request(method, url, data=data, headers=headers).prepare()
         path = urlsplit(url).path
         self.requests.append((method, path))
+        self.request_headers.append(dict(headers or {}))
         match = self.ROUTE.fullmatch(path)
         if match is None:
             return _response(request, 404)
@@ -907,6 +910,156 @@ class ModelPackClientTest(unittest.TestCase):
             with self.assertRaisesRegex(IsADirectoryError, "cannot replace a directory"):
                 ModelPackClient(oras_client=backend).pull(REFERENCE, output)
             self.assertEqual((output / "weights/keep.bin").read_bytes(), b"keep")
+
+    def test_push_rejects_layers_that_would_be_pulled_to_the_same_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("a", "b"):
+                (root / name).mkdir()
+                (root / name / "config.json").write_bytes(name.encode())
+            backend = FakeOrasClient()
+            client = ModelPackClient(oras_client=backend)
+
+            with self.assertRaisesRegex(InvalidModelPackError, "config.json"):
+                client.push(
+                    REFERENCE, [root / "a/config.json", root / "b/config.json"], ModelPackConfig()
+                )
+            self.assertEqual(backend.blobs, {})
+
+            client.push(
+                REFERENCE,
+                [
+                    ModelLayer(root / "a/config.json", artifact_path="a/config.json"),
+                    ModelLayer(root / "b/config.json", artifact_path="b/config.json"),
+                ],
+                ModelPackConfig(),
+            )
+
+    def test_corrupt_gzip_layer_is_invalid(self):
+        archive = BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as tar:
+            member = tarfile.TarInfo("weights/model.bin")
+            member.size = 1_000_000
+            tar.addfile(member, BytesIO(os.urandom(member.size)))
+        # Break the gzip stream with a deflate block of the reserved type, far enough
+        # into the file contents that tarfile reads the header without trouble.
+        compressor = zlib.compressobj(wbits=31)
+        corrupt = (
+            compressor.compress(archive.getvalue()[:600_000])
+            + compressor.flush(zlib.Z_FULL_FLUSH)
+            + b"\x07"
+        )
+        media_type = "application/vnd.cncf.model.weight.v1.tar+gzip"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layer = root / "weights.tar.gz"
+            layer.write_bytes(corrupt)
+            with self.subTest("push"), self.assertRaises(InvalidModelPackError):
+                ModelPackClient(oras_client=FakeOrasClient()).push(
+                    REFERENCE, [ModelLayer(layer, media_type=media_type)], ModelPackConfig()
+                )
+
+            backend = self._backend_with_layer(
+                FakeOrasClient(),
+                bytes(corrupt),
+                media_type,
+                {FILEPATH_ANNOTATION: "weights"},
+                diff_id="sha256:" + "0" * 64,
+            )
+            with self.subTest("pull"), self.assertRaises(InvalidModelPackError):
+                ModelPackClient(oras_client=backend).pull(REFERENCE, root / "out")
+
+    def test_pull_rejects_tar_layer_with_a_member_twice(self):
+        archive = BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as tar:
+            for name, data in (("x/one", b"one"), ("x/dup", b"first"), ("x/dup", b"second")):
+                member = tarfile.TarInfo(name)
+                member.size = len(data)
+                tar.addfile(member, BytesIO(data))
+        backend = self._backend_with_layer(
+            FakeOrasClient(), archive.getvalue(), WEIGHT_TAR_MEDIA_TYPE, {FILEPATH_ANNOTATION: "x"}
+        )
+        for overwrite in (False, True):
+            with self.subTest(overwrite=overwrite), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)
+                with self.assertRaisesRegex(InvalidModelPackError, "more than once"):
+                    ModelPackClient(oras_client=backend).pull(
+                        REFERENCE, output, overwrite=overwrite
+                    )
+                self.assertEqual([path for path in output.rglob("*") if path.is_file()], [])
+
+    def test_pull_stops_reading_a_blob_longer_than_its_descriptor(self):
+        backend = self._backend_with_layer(
+            FakeOrasClient(), b"weights", WEIGHT_RAW_MEDIA_TYPE, {FILEPATH_ANNOTATION: "w.bin"}
+        )
+        digest = backend.manifest["layers"][0]["digest"]
+        backend.blobs[digest] = b"weights" + b"\0" * (4 * 1024 * 1024)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            with self.assertRaisesRegex(InvalidModelPackError, "longer than its descriptor"):
+                ModelPackClient(oras_client=backend).pull(REFERENCE, output)
+            self.assertEqual(list(output.iterdir()), [])
+
+    def test_pull_rejects_manifest_over_4_mib(self):
+        backend = self._backend_with_layer(
+            FakeOrasClient(), b"weights", WEIGHT_RAW_MEDIA_TYPE, {FILEPATH_ANNOTATION: "w.bin"}
+        )
+        backend.manifest_bytes += b" " * (4 * 1024 * 1024)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(InvalidModelPackError, "manifest is larger"):
+                ModelPackClient(oras_client=backend).pull(REFERENCE, directory)
+
+    def test_requests_carry_the_oras_client_headers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model.bin"
+            model.write_bytes(b"weights")
+            for chunked in (False, True):
+                with self.subTest(chunked=chunked):
+                    backend = FakeOrasClient()
+                    backend.set_header("X-Registry-Key", "key")
+                    client = ModelPackClient(oras_client=backend)
+                    client.push(REFERENCE, [model], ModelPackConfig(), chunked=chunked)
+                    client.pull(REFERENCE, root / f"out-{chunked}")
+
+                    self.assertIn("POST", {method for method, _ in backend.requests})
+                    for (method, path), headers in zip(backend.requests, backend.request_headers, strict=True):
+                        self.assertEqual(headers.get("X-Registry-Key"), "key", (method, path))
+
+    def test_pulled_file_without_mode_follows_the_umask(self):
+        backend = self._backend_with_layer(
+            FakeOrasClient(), b"weights", WEIGHT_RAW_MEDIA_TYPE, {FILEPATH_ANNOTATION: "w.bin"}
+        )
+        umask = os.umask(0o027)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                result = ModelPackClient(oras_client=backend).pull(REFERENCE, directory)
+                self.assertEqual(stat.S_IMODE(result.files[0].stat().st_mode), 0o640)
+        finally:
+            os.umask(umask)
+
+    def test_empty_file_layer_when_the_registry_refuses_the_empty_blob(self):
+        class RefusingEmptyBlob(FakeOrasClient):
+            EMPTY = _sha256(b"")
+
+            def do_request(self, url, method="GET", data=None, headers=None, json=None, stream=False):
+                parts = urlsplit(url)
+                if self.EMPTY in parts.path or [self.EMPTY] == parse_qs(parts.query).get("digest"):
+                    request = requests.Request(method, url).prepare()
+                    return _response(request, 404 if method in ("GET", "HEAD") else 400)
+                return super().do_request(url, method, data, headers, json, stream)
+
+        backend = RefusingEmptyBlob()
+        client = ModelPackClient(oras_client=backend)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            empty = root / "__init__.py"
+            empty.write_bytes(b"")
+            client.push(REFERENCE, [empty], ModelPackConfig())
+            self.assertNotIn(_sha256(b""), backend.blobs)
+
+            result = client.pull(REFERENCE, root / "out")
+            self.assertEqual(result.files[0].read_bytes(), b"")
 
     def test_pull_tar_layer_respects_overwrite_false(self):
         backend = FakeOrasClient()

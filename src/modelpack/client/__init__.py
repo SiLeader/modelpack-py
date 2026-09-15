@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import errno
+import functools
 import gzip
 import hashlib
+import io
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import tarfile
 import tempfile
+import zlib
+from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from copy import deepcopy
@@ -19,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import jsonschema
 import oras.auth
@@ -81,7 +86,18 @@ _RFC3339_PATTERN = re.compile(
     r"(\d{4}-\d{2}-\d{2})[Tt](\d{2}:\d{2}:\d{2})(?:\.(\d+))?([Zz]|[+-]\d{2}:\d{2})"
 )
 
-_ARCHIVE_ERRORS = (tarfile.TarError, gzip.BadGzipFile, zstandard.ZstdError, EOFError)
+_ARCHIVE_ERRORS = (
+    tarfile.TarError,
+    gzip.BadGzipFile,
+    zlib.error,
+    zstandard.ZstdError,
+    EOFError,
+)
+
+#: The OCI distribution specification asks clients to accept manifests up to 4 MiB.
+_MAX_MANIFEST_SIZE = 4 * 1024 * 1024
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 def _is_digest(value: object) -> bool:
@@ -96,15 +112,31 @@ def _digest_bytes(payload: bytes, algorithm: str = "sha256") -> str:
     return f"{algorithm}:{hashlib.new(algorithm, payload).hexdigest()}"
 
 
+def _is_empty_blob(digest: str) -> bool:
+    return digest == _digest_bytes(b"", _algorithm(digest))
+
+
 def _digest_file(path: Path, algorithm: str = "sha256") -> tuple[str, int]:
     """Return the digest and size of a file, read in a single pass."""
-    hasher = hashlib.new(algorithm)
-    size = 0
     with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(_CHUNK_SIZE), b""):
-            hasher.update(chunk)
-            size += len(chunk)
-    return f"{algorithm}:{hasher.hexdigest()}", size
+        reader = _HashingReader(stream, algorithm)
+        return reader.digest_to_end(), reader.size
+
+
+def _new_file(directory: Path, prefix: str) -> Path:
+    """Create an empty file in ``directory`` named ``prefix`` plus random characters.
+
+    ``tempfile`` creates files only their owner can read. This one gets the
+    permissions the umask gives any new file, which a pulled file keeps unless its
+    layer carries a mode.
+    """
+    while True:
+        path = directory / f"{prefix}{secrets.token_hex(8)}"
+        try:
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+        except FileExistsError:
+            continue
+        return path
 
 
 def _reference_digest(reference: str) -> str | None:
@@ -273,16 +305,18 @@ class _HashingWriter:
 
 
 class _HashingReader:
-    """Read-only stream that hashes what is read from ``stream``."""
+    """Read-only stream that hashes and counts what is read from ``stream``."""
 
     def __init__(self, stream: Any, algorithm: str) -> None:
         self._stream = stream
         self._algorithm = algorithm
         self._hasher = hashlib.new(algorithm)
+        self.size = 0
 
     def read(self, size: int = -1) -> bytes:
         data = self._stream.read(size)
         self._hasher.update(data)
+        self.size += len(data)
         return data
 
     def digest_to_end(self) -> str:
@@ -292,12 +326,66 @@ class _HashingReader:
         return f"{self._algorithm}:{self._hasher.hexdigest()}"
 
 
+class _BlobReader(_HashingReader):
+    """Reads a blob, never more than one byte past the size its descriptor gives."""
+
+    def __init__(self, stream: Any, descriptor: Mapping[str, Any]) -> None:
+        super().__init__(stream, _algorithm(descriptor["digest"]))
+        self._expected_digest = descriptor["digest"]
+        self._expected_size = descriptor["size"]
+
+    def read(self, size: int = -1) -> bytes:
+        # One byte past the end is enough to tell that a blob is too long.
+        remaining = self._expected_size - self.size + 1
+        data = super().read(remaining if size < 0 else min(size, remaining))
+        if self.size > self._expected_size:
+            raise InvalidModelPackError(
+                f"blob {self._expected_digest} is longer than its descriptor size of "
+                f"{self._expected_size} bytes"
+            )
+        return data
+
+    def verify(self) -> None:
+        """Read the rest of the blob and check its size and digest."""
+        actual = self.digest_to_end()
+        if self.size != self._expected_size:
+            raise InvalidModelPackError(
+                f"blob size mismatch: expected {self._expected_size} bytes, "
+                f"got {self.size}"
+            )
+        if actual != self._expected_digest:
+            raise InvalidModelPackError(
+                f"blob digest mismatch: expected {self._expected_digest}, got {actual}"
+            )
+
+
+class _ResponseStream:
+    """Read-only stream over a streamed response body.
+
+    A read returns at most one chunk as it arrived, so it can be shorter than asked.
+    """
+
+    def __init__(self, response: Any) -> None:
+        self._chunks = response.iter_content(chunk_size=_CHUNK_SIZE)
+        self._pending = memoryview(b"")
+
+    def read(self, size: int = -1) -> bytes:
+        if not self._pending:
+            self._pending = memoryview(next(self._chunks, b""))
+        if size < 0:
+            size = len(self._pending)
+        data, self._pending = self._pending[:size], self._pending[size:]
+        return bytes(data)
+
+
 class _ReplayableBody:
     """File-backed request body that can be sent more than once.
 
     oras's ``do_request`` resends the same ``data`` after answering an auth
     challenge. requests sizes a body with ``len()`` every time it prepares a request,
-    so rewinding there makes a retried PUT send the whole file again.
+    so rewinding there makes a retried PUT send the whole file again. Being iterable
+    with ``tell()`` makes requests record the start of the body, which it seeks back
+    to when it follows a 307 or 308 redirect.
     """
 
     def __init__(self, stream: BinaryIO, size: int) -> None:
@@ -308,8 +396,17 @@ class _ReplayableBody:
         self._stream.seek(0)
         return self._size
 
+    def __iter__(self) -> Iterator[bytes]:
+        return iter(lambda: self._stream.read(_CHUNK_SIZE), b"")
+
     def read(self, size: int = -1) -> bytes:
         return self._stream.read(size)
+
+    def tell(self) -> int:
+        return self._stream.tell()
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        return self._stream.seek(offset, whence)
 
 
 @contextmanager
@@ -349,6 +446,21 @@ def _uncompressed_digest(path: Path, media_type: str, algorithm: str = "sha256")
             return _HashingReader(stream, algorithm).digest_to_end()
     except _ARCHIVE_ERRORS as error:
         raise InvalidModelPackError(f"cannot decompress layer: {path}") from error
+
+
+def _digest_layer_file(path: Path, media_type: str) -> tuple[str, int, str]:
+    """Return the digest, size and DiffID of a file layer, reading the file once."""
+    try:
+        with path.open("rb") as source:
+            blob = _HashingReader(source, "sha256")
+            diff_id = None
+            if media_type.endswith(_COMPRESSED_SUFFIXES):
+                with _decompressing(blob, media_type) as stream:
+                    diff_id = _HashingReader(stream, "sha256").digest_to_end()
+            digest = blob.digest_to_end()
+    except _ARCHIVE_ERRORS as error:
+        raise InvalidModelPackError(f"cannot decompress layer: {path}") from error
+    return digest, blob.size, diff_id or digest
 
 
 def _add_tar_member(archive: tarfile.TarFile, path: Path, name: str) -> None:
@@ -455,40 +567,48 @@ def _stage_tar_member(
 
 
 def _extract_tar_layer(
-    archive_path: Path,
+    blob: _BlobReader,
     media_type: str,
     destination: Path,
     overwrite: bool,
     diff_id: str | None,
 ) -> list[Path]:
-    """Unpack a tar layer into ``destination``.
+    """Unpack a tar layer read from ``blob`` into ``destination``.
 
-    Files are moved into place only after the whole archive has been read and, when
-    ``diff_id`` is given, the uncompressed tar has matched it. That way a compressed
-    layer is decompressed once rather than once to verify and again to unpack.
+    Files are moved into place only after the whole blob has been read and matched
+    its digest and, when ``diff_id`` is given, the uncompressed tar has matched it.
+    That way a layer is read once, straight from the registry, rather than saved,
+    verified and then unpacked.
     """
     staged: list[tuple[Path, Path]] = []
+    targets: set[Path] = set()
     try:
-        with archive_path.open("rb") as source, _decompressing(
-            source, media_type
-        ) as stream:
+        with _decompressing(blob, media_type) as stream:
             reader = _HashingReader(stream, _algorithm(diff_id)) if diff_id else stream
             with tarfile.open(fileobj=reader, mode="r|") as archive:
                 for member in archive:
                     staged_member = _stage_tar_member(
                         archive, member, destination, overwrite
                     )
-                    if staged_member is not None:
-                        staged.append(staged_member)
-            if diff_id:
-                _check_diff_id(diff_id, reader.digest_to_end())
+                    if staged_member is None:
+                        continue
+                    staged.append(staged_member)
+                    if staged_member[1] in targets:
+                        raise InvalidModelPackError(
+                            f"tar layer contains {member.name!r} more than once"
+                        )
+                    targets.add(staged_member[1])
+            actual_diff_id = reader.digest_to_end() if diff_id else None
+        blob.verify()
+        if diff_id:
+            _check_diff_id(diff_id, actual_diff_id)
 
-        files: list[Path] = []
-        for temporary_path, target in staged:
+        # Check every target before moving any, so a conflict leaves nothing placed.
+        for _, target in staged:
             _check_replaceable(target, overwrite)
+        for temporary_path, target in staged:
             os.replace(temporary_path, target)
-            files.append(target)
-        return files
+        return [target for _, target in staged]
     except _ARCHIVE_ERRORS as error:
         raise InvalidModelPackError(f"invalid tar layer: {error}") from error
     finally:
@@ -503,8 +623,31 @@ class _PreparedLayer:
     diff_id: str
 
 
-def _prepare_layer(item: ModelLayer | str | Path, packed_path: Path) -> _PreparedLayer:
-    layer = item if isinstance(item, ModelLayer) else ModelLayer(item)
+def _layer_name(layer: ModelLayer) -> str:
+    # Name the layer after the path as given: a symlink, such as a file in a
+    # Hugging Face cache snapshot, must not be named after the blob it points to.
+    return Path(os.path.abspath(Path(layer.path).expanduser())).name
+
+
+def _layer_file_path(layer: ModelLayer) -> str:
+    """Return the path a layer is pulled to."""
+    return layer.annotations.get(
+        FILEPATH_ANNOTATION, layer.artifact_path or _layer_name(layer)
+    )
+
+
+def _check_unique_file_paths(layers: Iterable[ModelLayer]) -> None:
+    counts = Counter(PurePosixPath(_layer_file_path(layer)) for layer in layers)
+    duplicates = sorted(str(path) for path, count in counts.items() if count > 1)
+    if duplicates:
+        raise InvalidModelPackError(
+            "more than one layer would be pulled to the same path: "
+            + ", ".join(duplicates)
+            + "; set artifact_path to tell them apart"
+        )
+
+
+def _prepare_layer(layer: ModelLayer, packed_path: Path) -> _PreparedLayer:
     given = Path(layer.path).expanduser()
     source = given.resolve()
     if not source.exists():
@@ -513,9 +656,7 @@ def _prepare_layer(item: ModelLayer | str | Path, packed_path: Path) -> _Prepare
     if media_type not in MODEL_LAYER_MEDIA_TYPES:
         raise InvalidModelPackError(f"unsupported ModelPack layer media type: {media_type}")
 
-    # Name the layer after the path as given: a symlink, such as a file in a
-    # Hugging Face cache snapshot, must not be named after the blob it points to.
-    name = Path(os.path.abspath(given)).name
+    name = _layer_name(layer)
     artifact_path = layer.artifact_path or name
     _safe_destination(Path("/modelpack"), artifact_path)
     annotations = dict(layer.annotations)
@@ -531,12 +672,7 @@ def _prepare_layer(item: ModelLayer | str | Path, packed_path: Path) -> _Prepare
         path = packed_path
     elif source.is_file():
         path = source
-        digest, size = _digest_file(source)
-        diff_id = (
-            _uncompressed_digest(source, media_type)
-            if media_type.endswith(_COMPRESSED_SUFFIXES)
-            else digest
-        )
+        digest, size, diff_id = _digest_layer_file(source, media_type)
     else:
         raise InvalidModelPackError(f"layers must be regular files or directories: {given}")
 
@@ -552,42 +688,170 @@ def _prepare_layer(item: ModelLayer | str | Path, packed_path: Path) -> _Prepare
     )
 
 
-def _renew_token_on_challenge(auth: oras.auth.TokenAuth) -> None:
-    """Make a token auth backend fetch a new token for every auth challenge.
+def _origin(url: str) -> tuple[str, str, int | None]:
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    return scheme, (parts.hostname or "").lower(), parts.port or _DEFAULT_PORTS.get(scheme)
 
-    oras answers a challenge by resending the token it already has. A challenge
-    means that token was rejected, for example because it was issued for pulling
-    another repository, so resending it only fails again.
+
+def _registry_origin(client: Any, container: Any) -> tuple[str, str, int | None]:
+    return _origin(f"{client.prefix}://{container.registry}")
+
+
+class _RegistryAuth:
+    """Mixin that keeps an oras auth backend to the registry it was created for.
+
+    oras answers any auth challenge with the backend's credentials, even one from
+    another host that a request was redirected to. oras's token backend also answers
+    a challenge by resending the token it already has, although a challenge means
+    that token was rejected, for example because it was issued for pulling another
+    repository, so resending it only fails again.
     """
-    authenticate_request = auth.authenticate_request
 
-    def authenticate_with_new_token(
-        original: Any, headers: dict, refresh: bool = False
+    registry_origin: tuple[str, str, int | None]
+    renew_tokens: bool
+
+    def authenticate_request(
+        self, original: Any, headers: dict, refresh: bool = False
     ) -> tuple[dict, bool]:
-        return authenticate_request(original, headers, refresh=True)
+        if _origin(original.url) != self.registry_origin:
+            # oras gives up on this exception at once, but retries others for minutes.
+            raise oras.auth.AuthenticationException(
+                f"{original.url} asked for credentials, which are only sent to the "
+                "registry itself"
+            )
+        return super().authenticate_request(  # type: ignore[misc]
+            original, headers, refresh=refresh or self.renew_tokens
+        )
 
-    auth.authenticate_request = authenticate_with_new_token  # type: ignore[method-assign]
+
+@functools.cache
+def _registry_auth_class(backend: type) -> type:
+    return type(f"Registry{backend.__name__}", (_RegistryAuth, backend), {})
+
+
+def _load_credentials(auth: Any, container: Any, config_path: str | Path | None) -> None:
+    """Load the credentials for ``container`` from Docker's file and ``config_path``.
+
+    Entries in ``config_path`` take precedence. oras would merge the files in no
+    particular order, so its backend is handed them already merged.
+    """
+    config: dict[str, Any] = {"auths": {}, "credHelpers": {}, "credsStore": None}
+    for path in (oras.utils.find_docker_config(), config_path):
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as stream:
+            document = json.load(stream)
+        config["auths"].update(document.get("auths") or {})
+        config["credHelpers"].update(document.get("credHelpers") or {})
+        config["credsStore"] = document.get("credsStore") or config["credsStore"]
+    auth._auth_config = config
+    auth.load_configs(container)
+
+
+def _forget_saved_credentials(hostname: str, config_path: str | Path | None) -> None:
+    """Remove the credentials for ``hostname`` from a Docker credential file."""
+    path = config_path or oras.utils.find_docker_config()
+    if not path:
+        return
+    path = Path(path).resolve()
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    auths = document.get("auths") or {}
+    hosts = [host for host in oras.utils.iter_localhosts(hostname) if host in auths]
+    if not hosts:
+        return
+    for host in hosts:
+        del auths[host]
+    # Replace the file in one step, so a failed write cannot leave it truncated.
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(document, stream, indent="\t")
+        os.replace(temporary_name, path)
+    except BaseException:
+        Path(temporary_name).unlink(missing_ok=True)
+        raise
+
+
+def _request(
+    client: Any,
+    container: Any,
+    url: str,
+    method: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    data: Any = None,
+    stream: bool = False,
+) -> Any:
+    """Send a request with the oras client's headers.
+
+    oras adds its token or Basic credentials to any URL it is given, so only requests
+    to the registry itself go through it. Others, such as an upload location on a
+    storage service, are sent without credentials.
+    """
+    request_headers = {**client.headers, **(headers or {})}
+    if _origin(url) == _registry_origin(client, container):
+        return client.do_request(
+            url, method, data=data, headers=request_headers, stream=stream
+        )
+    request_headers = {
+        name: value
+        for name, value in request_headers.items()
+        if name.lower() != "authorization"
+    }
+    return client.session.request(
+        method, url, data=data, headers=request_headers, stream=stream
+    )
+
+
+def _check_response(response: Any) -> None:
+    """Raise ValueError, as oras does, for a response without a 2xx status."""
+    if 200 <= response.status_code < 300:
+        return
+    message = f"{response.url} returned {response.status_code} {response.reason}"
+    try:
+        errors = response.json()["errors"]
+        message += "".join(f"; {error['code']}: {error.get('message')}" for error in errors)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        pass
+    raise ValueError(message)
+
+
+def _upload_location(response: Any) -> str:
+    location = response.headers.get("Location")
+    if not location:
+        raise ModelPackError("registry did not return a blob upload location")
+    # A relative location refers to the URL of the request it answers.
+    return urljoin(response.url, location)
+
+
+def _start_upload(client: Any, container: Any) -> str:
+    """Start a blob upload and return the URL its content goes to."""
+    response = _request(
+        client,
+        container,
+        f"{client.prefix}://{container.upload_blob_url()}",
+        "POST",
+        headers={"Content-Type": "application/octet-stream", "Content-Length": "0"},
+    )
+    _check_response(response)
+    return _upload_location(response)
 
 
 def _put_blob(
     client: Any, container: Any, path: Path, descriptor: Mapping[str, Any]
 ) -> Any:
     """Upload a blob as one streamed PUT, without reading it into memory."""
-    response = client.do_request(
-        f"{client.prefix}://{container.upload_blob_url()}",
-        "POST",
-        headers={"Content-Type": "application/octet-stream", "Content-Length": "0"},
-    )
-    client._check_200_response(response)
-    location = response.headers.get("Location")
-    if not location:
-        raise ModelPackError("registry did not return a blob upload location")
     upload_url = oras.utils.append_url_params(
-        urljoin(f"{client.prefix}://{container.registry}/", location),
-        {"digest": descriptor["digest"]},
+        _start_upload(client, container), {"digest": descriptor["digest"]}
     )
     with path.open("rb") as stream:
-        return client.do_request(
+        return _request(
+            client,
+            container,
             upload_url,
             "PUT",
             data=_ReplayableBody(stream, descriptor["size"]),
@@ -596,6 +860,59 @@ def _put_blob(
                 "Content-Length": str(descriptor["size"]),
             },
         )
+
+
+def _patch_blob(
+    client: Any,
+    container: Any,
+    path: Path,
+    descriptor: Mapping[str, Any],
+    chunk_size: int,
+) -> Any:
+    """Upload a blob in PATCH requests of ``chunk_size`` bytes and a closing PUT."""
+    upload_url = _start_upload(client, container)
+    offset = 0
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(chunk_size), b""):
+            response = _request(
+                client,
+                container,
+                upload_url,
+                "PATCH",
+                data=chunk,
+                headers={
+                    "Content-Type": "application/octet-stream",
+                    "Content-Length": str(len(chunk)),
+                    "Content-Range": f"{offset}-{offset + len(chunk) - 1}",
+                },
+            )
+            _check_response(response)
+            upload_url = _upload_location(response)
+            offset += len(chunk)
+    return _request(
+        client,
+        container,
+        oras.utils.append_url_params(upload_url, {"digest": descriptor["digest"]}),
+        "PUT",
+        headers={"Content-Length": "0"},
+    )
+
+
+@contextmanager
+def _open_blob(
+    client: Any, container: Any, descriptor: Mapping[str, Any]
+) -> Iterator[_BlobReader]:
+    """Stream a blob. Call ``verify()`` on the reader once it has been consumed."""
+    digest = descriptor["digest"]
+    if _is_empty_blob(digest):
+        # Some registries neither accept nor serve the empty blob, whose content is
+        # known anyway.
+        yield _BlobReader(io.BytesIO(), descriptor)
+        return
+    url = f"{client.prefix}://{container.get_blob_url(digest)}"
+    with _request(client, container, url, "GET", stream=True) as response:
+        _check_response(response)
+        yield _BlobReader(_ResponseStream(response), descriptor)
 
 
 class ModelPackClient:
@@ -617,10 +934,6 @@ class ModelPackClient:
         self._tls_verify = tls_verify
         self._auth_backend = auth_backend
         self._oras_client = oras_client
-        # oras keeps tokens and Basic credentials on a client's auth backend and sends
-        # them to whichever host it talks to, and it reads credential files only once
-        # per client. So each registry and credential file gets its own oras client.
-        self._clients: dict[tuple[str, str | None], Any] = {}
         self._credentials: dict[str, tuple[str, str]] = {}
 
     def login(
@@ -645,15 +958,21 @@ class ModelPackClient:
             config_path=str(config_path) if config_path else None,
         )
         self._credentials[hostname] = (username, password)
-        self._forget_clients(hostname)
         return result
 
-    def logout(self, hostname: str) -> None:
+    def logout(
+        self, hostname: str, *, config_path: str | Path | None = None
+    ) -> None:
+        """Forget the credentials for ``hostname``.
+
+        Like ``docker logout``, this also removes them from the credential file that
+        ``login()`` saved them to, so pass the same ``config_path``.
+        """
+        _forget_saved_credentials(hostname, config_path)
         if self._oras_client is not None:
             self._oras_client.logout(hostname)
             return
         self._credentials.pop(hostname, None)
-        self._forget_clients(hostname)
 
     def push(
         self,
@@ -671,12 +990,16 @@ class ModelPackClient:
         Each blob is streamed in a single PUT request. ``chunked=True`` uploads layers
         in ``chunk_size`` PATCH requests instead, which not every registry supports.
         """
+        model_layers = [
+            item if isinstance(item, ModelLayer) else ModelLayer(item) for item in layers
+        ]
+        _check_unique_file_paths(model_layers)
         client, container = self._registry_client(reference, config_path)
         with tempfile.TemporaryDirectory(prefix="modelpack-") as temporary_dir:
             temporary_root = Path(temporary_dir)
             prepared = [
-                _prepare_layer(item, temporary_root / f"layer-{index}.tar")
-                for index, item in enumerate(layers)
+                _prepare_layer(layer, temporary_root / f"layer-{index}.tar")
+                for index, layer in enumerate(model_layers)
             ]
             config_document = self._build_config(
                 config, [layer.diff_id for layer in prepared]
@@ -722,13 +1045,15 @@ class ModelPackClient:
 
         # The manifest is uploaded as exact bytes so its digest is unambiguous.
         payload = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
-        response = client.do_request(
+        response = _request(
+            client,
+            container,
             f"{client.prefix}://{container.manifest_url()}",
             "PUT",
             headers={"Content-Type": OCI_MANIFEST_MEDIA_TYPE},
             data=payload,
         )
-        client._check_200_response(response)
+        _check_response(response)
         _check_reported_digest(response, payload)
         return PushResult(
             reference=str(container),
@@ -760,7 +1085,7 @@ class ModelPackClient:
         output_root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix="modelpack-") as temporary_dir:
             config_file = Path(temporary_dir) / "config.json"
-            self._download(client, container, manifest["config"]["digest"], config_file)
+            self._download(client, container, manifest["config"], config_file)
             try:
                 config_document = json.loads(config_file.read_bytes())
             except ValueError as error:
@@ -817,34 +1142,35 @@ class ModelPackClient:
 
         blob_digest = layer["digest"]
         compressed = media_type.endswith(_COMPRESSED_SUFFIXES)
-        # The DiffID of an uncompressed layer is its blob digest, which _download
-        # verifies, so it only needs hashing again for a different algorithm.
-        same_algorithm = _algorithm(diff_id) == _algorithm(blob_digest)
-        if not compressed and same_algorithm:
+        # The DiffID of an uncompressed layer is its blob digest, which is verified
+        # while downloading, so it only needs hashing again for another algorithm.
+        diff_id_verified = not compressed and _algorithm(diff_id) == _algorithm(
+            blob_digest
+        )
+        if diff_id_verified:
             _check_diff_id(diff_id, blob_digest)
 
-        with tempfile.NamedTemporaryFile(
-            prefix=".modelpack-layer-", dir=output_root, delete=False
-        ) as temporary:
-            temporary_path = Path(temporary.name)
-        try:
-            self._download(client, container, blob_digest, temporary_path)
-            if not compressed and not same_algorithm:
-                _check_diff_id(
-                    diff_id, _digest_file(temporary_path, _algorithm(diff_id))[0]
-                )
-            if is_tar and unpack:
+        if is_tar and unpack:
+            with _open_blob(client, container, layer) as blob:
                 return _extract_tar_layer(
-                    temporary_path,
+                    blob,
                     media_type,
                     output_root,
                     overwrite,
-                    diff_id if compressed else None,
+                    None if diff_id_verified else diff_id,
                 )
+
+        temporary_path = _new_file(output_root, ".modelpack-layer-")
+        try:
+            self._download(client, container, layer, temporary_path)
             if compressed:
                 _check_diff_id(
                     diff_id,
                     _uncompressed_digest(temporary_path, media_type, _algorithm(diff_id)),
+                )
+            elif not diff_id_verified:
+                _check_diff_id(
+                    diff_id, _digest_file(temporary_path, _algorithm(diff_id))[0]
                 )
 
             _apply_file_metadata(temporary_path, annotations.get(FILE_METADATA_ANNOTATION))
@@ -859,22 +1185,20 @@ class ModelPackClient:
         self, reference: str, config_path: str | Path | None
     ) -> tuple[Any, Any]:
         """Return the oras client to use for ``reference`` and the parsed container."""
-        configs = [str(config_path)] if config_path else None
         if self._oras_client is not None:
             container = self._oras_client.get_container(reference)
+            configs = [str(config_path)] if config_path else None
             self._oras_client.auth.load_configs(container, configs=configs)
             return self._oras_client, container
 
         container = oras.container.Container(reference, registry=self._hostname)
-        key = (container.registry, configs[0] if configs else None)
-        client = self._clients.get(key)
-        if client is None:
-            client = self._new_oras_client(container.registry)
-            client.auth.load_configs(container, configs=configs)
-            credentials = self._credentials.get(container.registry)
-            if credentials is not None:
-                client.auth.set_basic_auth(*credentials)
-            self._clients[key] = client
+        # Every call gets a new oras client, so credential files are read again and a
+        # token or Basic credentials never outlive a logout or reach another registry.
+        client = self._new_oras_client(container.registry)
+        _load_credentials(client.auth, container, config_path)
+        credentials = self._credentials.get(container.registry)
+        if credentials is not None:
+            client.auth.set_basic_auth(*credentials)
         return client, container
 
     def _new_oras_client(self, registry: str) -> Any:
@@ -884,15 +1208,17 @@ class ModelPackClient:
             tls_verify=self._tls_verify,
             auth_backend=self._auth_backend,
         )
+        # Requests that skip oras, such as uploads to another host, use the session's.
+        client.session.verify = self._tls_verify
+        backend = type(client.auth)
+        auth_class = _registry_auth_class(backend)
+        auth = auth_class.__new__(auth_class)
+        vars(auth).update(vars(client.auth))
+        auth.registry_origin = _origin(f"{client.prefix}://{registry}")
         # Subclasses such as the ECR backend manage their own tokens.
-        if type(client.auth) is oras.auth.TokenAuth:
-            _renew_token_on_challenge(client.auth)
+        auth.renew_tokens = backend is oras.auth.TokenAuth
+        client.auth = auth
         return client
-
-    def _forget_clients(self, hostname: str) -> None:
-        self._clients = {
-            key: client for key, client in self._clients.items() if key[0] != hostname
-        }
 
     @staticmethod
     def _upload_blob(
@@ -904,27 +1230,40 @@ class ModelPackClient:
         chunked: bool,
         chunk_size: int,
     ) -> None:
-        if client.blob_exists(descriptor, container):
+        blob_url = f"{client.prefix}://{container.get_blob_url(descriptor['digest'])}"
+        if _request(client, container, blob_url, "HEAD").status_code == 200:
             return
         if chunked:
-            response = client.chunked_upload(
-                str(path), container, descriptor, chunk_size=chunk_size
-            )
+            response = _patch_blob(client, container, path, descriptor, chunk_size)
         else:
             response = _put_blob(client, container, path, descriptor)
-        client._check_200_response(response)
+        if _is_empty_blob(descriptor["digest"]) and response.status_code >= 300:
+            # Like oras, accept that a registry refuses the empty blob, which pull
+            # never fetches.
+            return
+        _check_response(response)
 
     @staticmethod
     def _get_manifest(client: Any, container: Any, reference: str) -> dict[str, Any]:
         """Fetch the manifest, verifying it against a digest reference when given."""
         expected = _reference_digest(reference)
-        response = client.do_request(
+        with _request(
+            client,
+            container,
             f"{client.prefix}://{container.manifest_url()}",
             "GET",
             headers={"Accept": OCI_MANIFEST_MEDIA_TYPE},
-        )
-        client._check_200_response(response)
-        payload = response.content
+            stream=True,
+        ) as response:
+            _check_response(response)
+            received = bytearray()
+            for chunk in response.iter_content(chunk_size=_CHUNK_SIZE):
+                received += chunk
+                if len(received) > _MAX_MANIFEST_SIZE:
+                    raise InvalidModelPackError(
+                        f"manifest is larger than {_MAX_MANIFEST_SIZE} bytes"
+                    )
+        payload = bytes(received)
         if expected:
             actual = _digest_bytes(payload, _algorithm(expected))
             if actual != expected:
@@ -941,20 +1280,15 @@ class ModelPackClient:
         return manifest
 
     @staticmethod
-    def _download(client: Any, container: Any, digest: str, destination: Path) -> None:
-        """Stream a blob into ``destination`` and verify its digest."""
-        hasher = hashlib.new(_algorithm(digest))
-        with client.get_blob(container, digest, stream=True) as response:
-            client._check_200_response(response)
-            with destination.open("wb") as output:
-                for chunk in response.iter_content(chunk_size=_CHUNK_SIZE):
-                    hasher.update(chunk)
-                    output.write(chunk)
-        actual = f"{_algorithm(digest)}:{hasher.hexdigest()}"
-        if actual != digest:
-            raise InvalidModelPackError(
-                f"blob digest mismatch: expected {digest}, got {actual}"
-            )
+    def _download(
+        client: Any, container: Any, descriptor: Mapping[str, Any], destination: Path
+    ) -> None:
+        """Stream a blob into ``destination`` and verify its size and digest."""
+        with _open_blob(client, container, descriptor) as blob, destination.open(
+            "wb"
+        ) as output:
+            shutil.copyfileobj(blob, output, _CHUNK_SIZE)
+            blob.verify()
 
     @staticmethod
     def _build_config(

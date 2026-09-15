@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import itertools
 import json
 import re
 import secrets
@@ -14,6 +15,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
+
+import oras.auth
 
 from modelpack import (
     InvalidModelPackError,
@@ -36,6 +39,8 @@ def _basic(username: str, password: str) -> str:
 
 class RegistryHandler(BaseHTTPRequestHandler):
     server: RegistryServer
+    # A client that announces a body and does not send it must not hang the test.
+    timeout = 5
 
     def log_message(self, format, *args) -> None:
         pass
@@ -91,6 +96,8 @@ class RegistryHandler(BaseHTTPRequestHandler):
         self._send(200, json.dumps({"token": token}).encode())
 
     def _authorized(self, authorization, name, actions) -> bool:
+        if self.server.anonymous:
+            return True
         if not authorization or not authorization.startswith("Bearer "):
             return False
         granted = self.server.tokens.get(authorization.removeprefix("Bearer "), set())
@@ -103,11 +110,23 @@ class RegistryHandler(BaseHTTPRequestHandler):
         self._send(401, b'{"errors":[{"code":"UNAUTHORIZED"}]}', {"WWW-Authenticate": header})
 
     def _upload(self, name, ref, query, body) -> None:
-        uploads = self.server.uploads
+        registry = self.server
+        uploads = registry.uploads
         if self.command == "POST":
             upload = secrets.token_hex(8)
+            location = f"/v2/{name}/blobs/uploads/{upload}"
+            if registry.upload_server is not None:
+                registry.upload_server.uploads[upload] = bytearray()
+                return self._send(
+                    202, headers={"Location": f"http://{registry.upload_server.host}{location}"}
+                )
             uploads[upload] = bytearray()
-            return self._send(202, headers={"Location": f"/v2/{name}/blobs/uploads/{upload}"})
+            return self._send(202, headers={"Location": location})
+        target = registry.redirect_puts_to
+        if self.command == "PUT" and target is not None and "redirected" not in parse_qs(query):
+            target.uploads.setdefault(ref, bytearray())
+            location = f"http://{target.host}{self.path}&redirected=1"
+            return self._send(307, headers={"Location": location})
         uploads[ref] += body
         if self.command == "PATCH":
             self.server.patches += 1
@@ -158,6 +177,9 @@ class RegistryServer(ThreadingHTTPServer):
         self.manifests: dict[tuple[str, str], bytes] = {}
         self.patches = 0
         self.expire_tokens_before_put = False
+        self.anonymous = False
+        self.upload_server: RegistryServer | None = None
+        self.redirect_puts_to: RegistryServer | None = None
         threading.Thread(
             target=self.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
         ).start()
@@ -254,21 +276,108 @@ class RegistryTest(unittest.TestCase):
         self.assertGreater(registry.patches, 1)
         self.assertIn(_sha256(self.model.read_bytes()), registry.blobs)
 
+    def write_credentials(self, path: Path, host: str, password: str) -> Path:
+        auth = base64.b64encode(f"user:{password}".encode()).decode()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"auths": {host: {"auth": auth}}}))
+        return path
+
     def test_config_path_is_read_on_every_call(self):
         registry = self.registry("user", "secret")
-        configs = {}
-        for name, password in (("wrong", "nope"), ("right", "secret")):
-            configs[name] = self.root / f"{name}.json"
-            auth = base64.b64encode(f"user:{password}".encode()).decode()
-            configs[name].write_text(json.dumps({"auths": {registry.host: {"auth": auth}}}))
+        config = self.write_credentials(self.root / "config.json", registry.host, "nope")
         client = ModelPackClient(insecure=True)
         reference = f"{registry.host}/models/tiny:1"
 
         with self.assertRaises(ValueError):
-            client.push(reference, [self.model], ModelPackConfig(), config_path=configs["wrong"])
-        client.push(reference, [self.model], ModelPackConfig(), config_path=configs["right"])
+            client.push(reference, [self.model], ModelPackConfig(), config_path=config)
+        self.write_credentials(config, registry.host, "secret")
+        client.push(reference, [self.model], ModelPackConfig(), config_path=config)
 
         self.assertIn(("models/tiny", "1"), registry.manifests)
+
+    def test_config_path_takes_precedence_over_docker_config(self):
+        registry = self.registry("user", "secret")
+        reference = f"{registry.host}/models/tiny:1"
+        docker_config = self.root / "home/.docker/config.json"
+        cases = {"custom is right": ("nope", "secret"), "custom is wrong": ("secret", "nope")}
+        # Merging the files in set order would pick either file, depending on the names.
+        for (name, (docker_password, custom_password)), index in itertools.product(
+            cases.items(), range(8)
+        ):
+            with self.subTest(name, index=index):
+                custom_config = self.root / f"custom-{index}.json"
+                self.write_credentials(docker_config, registry.host, docker_password)
+                self.write_credentials(custom_config, registry.host, custom_password)
+                client = ModelPackClient(insecure=True)
+                if custom_password == "secret":
+                    client.push(reference, [self.model], ModelPackConfig(), config_path=custom_config)
+                else:
+                    with self.assertRaises(ValueError):
+                        client.push(reference, [self.model], ModelPackConfig(), config_path=custom_config)
+
+    def test_logout_removes_the_credentials_login_saved(self):
+        registry = self.registry("user", "secret")
+        reference = f"{registry.host}/models/tiny:1"
+        cases = {"docker config": None, "custom config": self.root / "custom.json"}
+        for name, config_path in cases.items():
+            with self.subTest(name):
+                client = ModelPackClient(insecure=True)
+                client.login(registry.host, "user", "secret", config_path=config_path)
+                client.push(reference, [self.model], ModelPackConfig(), config_path=config_path)
+
+                client.logout(registry.host, config_path=config_path)
+
+                saved = json.loads((config_path or self.root / "home/.docker/config.json").read_text())
+                self.assertNotIn(registry.host, saved["auths"])
+                for pusher in (client, ModelPackClient(insecure=True)):
+                    with self.assertRaises(ValueError):
+                        pusher.push(reference, [self.model], ModelPackConfig(), config_path=config_path)
+
+    def test_streamed_put_is_resent_in_full_after_a_redirect(self):
+        registry = self.registry("user", "secret")
+        registry.redirect_puts_to = registry
+        client = ModelPackClient(insecure=True)
+        client.login(registry.host, "user", "secret")
+
+        client.push(f"{registry.host}/models/tiny:1", [self.model], ModelPackConfig())
+
+        self.assertIn(_sha256(self.model.read_bytes()), registry.blobs)
+
+    def test_credentials_are_not_sent_to_another_upload_host(self):
+        for redirect in (False, True):
+            with self.subTest(redirect=redirect):
+                registry = self.registry("user", "secret")
+                storage = self.registry("user", "secret")
+                if redirect:
+                    registry.redirect_puts_to = storage
+                else:
+                    registry.upload_server = storage
+                client = ModelPackClient(insecure=True)
+                client.login(registry.host, "user", "secret")
+
+                with self.assertRaises((ValueError, oras.auth.AuthenticationException)):
+                    client.push(f"{registry.host}/models/tiny:1", [self.model], ModelPackConfig())
+
+                self.assertIn("PUT", [method for method, _ in storage.requests])
+                self.assertEqual(storage.authorizations, [])
+
+    def test_upload_to_another_host_works_without_credentials(self):
+        for redirect in (False, True):
+            with self.subTest(redirect=redirect):
+                registry = self.registry("user", "secret")
+                storage = self.registry()
+                storage.anonymous = True
+                if redirect:
+                    registry.redirect_puts_to = storage
+                else:
+                    registry.upload_server = storage
+                client = ModelPackClient(insecure=True)
+                client.login(registry.host, "user", "secret")
+
+                client.push(f"{registry.host}/models/tiny:1", [self.model], ModelPackConfig())
+
+                self.assertIn(_sha256(self.model.read_bytes()), storage.blobs)
+                self.assertEqual(storage.authorizations, [])
 
     def test_pull_by_digest_detects_a_tampered_manifest(self):
         registry = self.registry("user", "secret")
