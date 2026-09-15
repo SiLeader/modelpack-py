@@ -1,0 +1,21 @@
+[project]
+name = "modelpack"
+version = "0.1.0"
+description = "Python client for pushing and pulling CNCF ModelPack OCI artifacts"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "oras>=0.2.43",
+    "zstandard>=0.23",
+]
+
+[project.scripts]
+modelpack = "modelpack.__main__:main"
+
+[[tool.uv.index]]
+url = "https://pypi.flatt.tech/simple/"
+default = true
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
