@@ -10,6 +10,14 @@ from .client import ModelPackClient
 from .models import ModelLayer
 
 
+def _parse_layer(value: str) -> ModelLayer:
+    """Parse ``PATH[:MEDIA_TYPE]``, where PATH may itself contain colons."""
+    path, separator, media_type = value.rpartition(":")
+    if separator and path and media_type.startswith("application/"):
+        return ModelLayer(path=path, media_type=media_type)
+    return ModelLayer(path=value)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="modelpack")
     parser.add_argument("--insecure", action="store_true", help="use HTTP for registry")
@@ -44,15 +52,10 @@ def main() -> None:
         print("\n".join(str(path) for path in result.files))
         return
 
-    layers = []
-    for value in args.layer:
-        path, separator, media_type = value.rpartition(":")
-        if not separator or not Path(path).exists():
-            path, media_type = value, ""
-        layers.append(
-            ModelLayer(path=path, media_type=media_type)
-            if media_type
-            else ModelLayer(path=path)
-        )
+    layers = [_parse_layer(value) for value in args.layer]
     result = client.push(args.reference, layers, args.config)
     print(json.dumps({"reference": result.reference, "digest": result.digest}))
+
+
+if __name__ == "__main__":
+    main()
