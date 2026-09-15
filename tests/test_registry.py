@@ -18,13 +18,13 @@ from urllib.parse import parse_qs, urlsplit
 
 import oras.auth
 
-from modelpack import (
+from modelpack_client import (
     InvalidModelPackError,
     ModelLayer,
     ModelPackClient,
     ModelPackConfig,
 )
-from modelpack.constants import OCI_MANIFEST_MEDIA_TYPE
+from modelpack_client.constants import OCI_MANIFEST_MEDIA_TYPE
 
 ROUTE = re.compile(r"/v2/(?P<name>.+?)/(?P<kind>blobs/uploads|blobs|manifests)/(?P<ref>[^/]*)")
 

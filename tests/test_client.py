@@ -21,7 +21,7 @@ import oras.client
 import requests
 import zstandard
 
-from modelpack import (
+from modelpack_client import (
     InvalidModelPackError,
     ModelCapabilities,
     ModelDescriptor,
@@ -31,8 +31,8 @@ from modelpack import (
     ModelTechnicalConfig,
     UnsafePathError,
 )
-from modelpack.__main__ import _parse_layer
-from modelpack.constants import (
+from modelpack_client.__main__ import _parse_layer
+from modelpack_client.constants import (
     CODE_RAW_MEDIA_TYPE,
     CODE_TAR_MEDIA_TYPE,
     DATASET_RAW_MEDIA_TYPE,
@@ -1088,7 +1088,7 @@ class ModelPackClientTest(unittest.TestCase):
 class CommandLineTest(unittest.TestCase):
     def test_python_m_modelpack_runs_the_cli(self):
         result = subprocess.run(
-            [sys.executable, "-m", "modelpack", "--help"],
+            [sys.executable, "-m", "modelpack_client", "--help"],
             capture_output=True,
             text=True,
             env={**os.environ, "PYTHONPATH": str(SOURCE_ROOT)},

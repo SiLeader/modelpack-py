@@ -7,13 +7,13 @@ OCI Distribution-compatible registry, including Harbor, Docker Hub, and GHCR.
 ## Installation
 
 ```console
-pip install modelpack
+pip install modelpack-client
 ```
 
 ## Python API
 
 ```python
-from modelpack import (
+from modelpack_client import (
     ModelDescriptor,
     ModelLayer,
     ModelPackClient,
@@ -99,4 +99,4 @@ modelpack push ghcr.io/example/models/example:1.0.0 \
 modelpack pull ghcr.io/example/models/example:1.0.0 ./model
 ```
 
-`python -m modelpack` runs the same CLI.
+`python -m modelpack_client` runs the same CLI.
